@@ -8,8 +8,12 @@ image:
 imagePullSecrets: []
 
 service:
-  type: ClusterIP
+  type: NodePort
   port: 8080
+  # Kubernetes only allows NodePort values in the cluster's configured
+  # --service-node-port-range (default 30000-32767); this can't be 8080
+  # unless that range is widened cluster-wide.
+  nodePort: 30081
 
 ingress:
   enabled: false
