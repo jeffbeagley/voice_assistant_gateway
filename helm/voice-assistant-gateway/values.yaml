@@ -1,0 +1,93 @@
+replicaCount: 1
+
+image:
+  repository: 172.16.8.25:5000/voice_assistant_gateway
+  tag: "0.0.6"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: voice-gateway.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# --- Application configuration ---
+# These map to GATEWAY_* environment variables consumed by app/config.py
+config:
+  logLevel: info
+
+  parakeet:
+    baseUrl: "http://parakeet-api.voice-agent.svc.cluster.local:5092"
+    transcribePath: "/v1/audio/transcriptions"
+    model: "parakeet"
+    timeoutSeconds: 30
+
+  vllm:
+    baseUrl: "http://vllm-vllm-qwen3-5-9b-engine-service.vllm.svc.cluster.local:80"
+    chatPath: "/v1/chat/completions"
+    model: "cyankiwi/Qwen3.5-9B-AWQ-4bit"
+    timeoutSeconds: 60
+    maxTokens: 512
+    temperature: 0.7
+    systemPrompt: "You are a helpful, concise voice assistant. Keep replies short and conversational since they will be read aloud."
+    # Set via a Secret and vllm.apiKeySecretName instead if the endpoint requires auth.
+    apiKey: ""
+
+  # rhasspy/wyoming-piper speaks the Wyoming protocol over plain TCP (not HTTP).
+  piper:
+    host: "piper-tts.voice-agent.svc.cluster.local"
+    port: 10200
+    voice: ""
+
+  session:
+    maxHistoryTurns: 10
+    idleTimeoutSeconds: 300
+
+# Name of an existing Secret containing key VLLM_API_KEY, used instead of config.vllm.apiKey when set.
+existingSecret: ""

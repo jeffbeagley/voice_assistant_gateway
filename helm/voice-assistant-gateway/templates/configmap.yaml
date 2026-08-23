@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "voice-assistant-gateway.fullname" . }}
+  labels:
+    {{- include "voice-assistant-gateway.labels" . | nindent 4 }}
+data:
+  GATEWAY_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+
+  GATEWAY_PARAKEET_BASE_URL: {{ .Values.config.parakeet.baseUrl | quote }}
+  GATEWAY_PARAKEET_TRANSCRIBE_PATH: {{ .Values.config.parakeet.transcribePath | quote }}
+  GATEWAY_PARAKEET_MODEL: {{ .Values.config.parakeet.model | quote }}
+  GATEWAY_PARAKEET_TIMEOUT_SECONDS: {{ .Values.config.parakeet.timeoutSeconds | quote }}
+
+  GATEWAY_VLLM_BASE_URL: {{ .Values.config.vllm.baseUrl | quote }}
+  GATEWAY_VLLM_CHAT_PATH: {{ .Values.config.vllm.chatPath | quote }}
+  GATEWAY_VLLM_MODEL: {{ .Values.config.vllm.model | quote }}
+  GATEWAY_VLLM_TIMEOUT_SECONDS: {{ .Values.config.vllm.timeoutSeconds | quote }}
+  GATEWAY_VLLM_MAX_TOKENS: {{ .Values.config.vllm.maxTokens | quote }}
+  GATEWAY_VLLM_TEMPERATURE: {{ .Values.config.vllm.temperature | quote }}
+  GATEWAY_SYSTEM_PROMPT: {{ .Values.config.vllm.systemPrompt | quote }}
+
+  GATEWAY_PIPER_HOST: {{ .Values.config.piper.host | quote }}
+  GATEWAY_PIPER_PORT: {{ .Values.config.piper.port | quote }}
+  GATEWAY_PIPER_VOICE: {{ .Values.config.piper.voice | quote }}
+
+  GATEWAY_MAX_HISTORY_TURNS: {{ .Values.config.session.maxHistoryTurns | quote }}
+  GATEWAY_SESSION_IDLE_TIMEOUT_SECONDS: {{ .Values.config.session.idleTimeoutSeconds | quote }}

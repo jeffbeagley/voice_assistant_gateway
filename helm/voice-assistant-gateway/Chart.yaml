@@ -1,0 +1,6 @@
+apiVersion: v2
+name: voice-assistant-gateway
+description: Gateway that bridges an Echo-style client to Parakeet STT, vLLM, and Piper TTS
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -1,0 +1,8 @@
+voice-assistant-gateway has been installed.
+
+WebSocket endpoint (from inside the cluster):
+  ws://{{ include "voice-assistant-gateway.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/ws/converse
+
+Health checks:
+  GET /healthz
+  GET /readyz

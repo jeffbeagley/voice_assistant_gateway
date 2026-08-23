@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Voice Gateway</title>
+<!--
+  Wake-word detection uses the pretrained "hey_jarvis" openWakeWord model
+  (github.com/dscripka/openWakeWord, code: Apache-2.0, pretrained models:
+  CC BY-NC-SA 4.0 - non-commercial use only) run client-side via
+  onnxruntime-web. The melspectrogram -> embedding -> classifier inference
+  chain below is adapted from the browser reference implementation at
+  github.com/dnavarrom/openwakeword_wasm (itself inspired by
+  deepcorelabs.com/open-wake-word-on-the-web).
+-->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    font-family: system-ui, sans-serif;
+    max-width: 480px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    background: #060a17;
+    color: #dce6ff;
+    text-align: center;
+  }
+  h1 { font-size: 1.2rem; font-weight: 500; color: #7fb2ff; letter-spacing: 0.03em; }
+
+  #orb {
+    width: 160px; height: 160px; margin: 1.5rem auto;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #4fa3ff, #0b3d91 70%);
+    box-shadow: 0 0 20px 4px rgba(70, 140, 255, 0.35);
+    transition: box-shadow 0.2s ease, transform 0.2s ease, filter 0.3s ease;
+  }
+  #orb.state-disconnected { background: radial-gradient(circle at 35% 30%, #3a4258, #1a1e2b 70%); box-shadow: none; filter: grayscale(0.6); }
+  #orb.state-idle { animation: breathe 2.6s ease-in-out infinite; }
+  #orb.state-wake { animation: flash 0.4s ease-out; box-shadow: 0 0 60px 20px rgba(120, 190, 255, 0.9); }
+  #orb.state-recording { box-shadow: 0 0 45px 14px rgba(90, 170, 255, 0.85); }
+  #orb.state-sending, #orb.state-awaiting { animation: think 1s linear infinite; }
+  #orb.state-speaking { animation: talk 0.5s ease-in-out infinite; }
+
+  @keyframes breathe {
+    0%, 100% { box-shadow: 0 0 20px 4px rgba(70, 140, 255, 0.3); transform: scale(1); }
+    50% { box-shadow: 0 0 32px 8px rgba(70, 140, 255, 0.55); transform: scale(1.03); }
+  }
+  @keyframes flash {
+    0% { box-shadow: 0 0 20px 4px rgba(70, 140, 255, 0.3); }
+    40% { box-shadow: 0 0 70px 24px rgba(140, 200, 255, 1); }
+    100% { box-shadow: 0 0 45px 14px rgba(90, 170, 255, 0.85); }
+  }
+  @keyframes think {
+    0%, 100% { filter: brightness(1); } 50% { filter: brightness(1.4); }
+  }
+  @keyframes talk {
+    0%, 100% { transform: scale(1); } 50% { transform: scale(1.06); }
+  }
+
+  #statusText { font-size: 1rem; color: #9db8e8; min-height: 1.4em; }
+  #level { height: 6px; width: 100%; background: #131a2e; border-radius: 3px; margin: 0.75rem 0; overflow: hidden; }
+  #levelFill { height: 100%; width: 0%; background: linear-gradient(90deg, #2f6fe0, #7fc4ff); transition: width 0.08s linear; }
+
+  #startBtn {
+    font-size: 1rem; padding: 0.6rem 1.4rem; margin: 0.5rem 0 1rem;
+    background: #1a3a8f; color: #dce6ff; border: 1px solid #3a6ad6; border-radius: 8px; cursor: pointer;
+  }
+  #startBtn:disabled { opacity: 0.5; cursor: default; }
+
+  #log {
+    background: #0b0f1c; border: 1px solid #1c2740; color: #7fb2ff;
+    padding: 0.75rem; height: 260px; overflow-y: auto; text-align: left;
+    font-family: monospace; font-size: 0.8rem; white-space: pre-wrap; border-radius: 8px;
+  }
+</style>
+</head>
+<body>
+<h1>Voice Gateway — say &ldquo;Hey Jarvis&rdquo;</h1>
+
+<div id="orb" class="state-disconnected"></div>
+<div id="statusText">Connecting...</div>
+<div id="level"><div id="levelFill"></div></div>
+
+<button id="startBtn">Enable Microphone &amp; Start</button>
+
+<div id="log"></div>
+
+<script>
+const WS_URL = `ws://${location.hostname}:8080/ws/converse`;
+const ORT_BASE = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/";
+ort.env.wasm.wasmPaths = ORT_BASE;
+
+const SAMPLE_RATE = 16000;
+const FRAME_SIZE = 1280; // 80ms @ 16kHz, openWakeWord's native frame size
+const WAKE_THRESHOLD = 0.5;
+const WAKE_COOLDOWN_MS = 2500;
+const SPEECH_RMS = 0.02;
+const SILENCE_HANGOVER_FRAMES = 15; // ~1.2s of quiet after speech ends the utterance
+const MAX_RECORD_FRAMES = 150; // ~12s safety cap
+
+const orbEl = document.getElementById("orb");
+const statusEl = document.getElementById("statusText");
+const levelFillEl = document.getElementById("levelFill");
+const startBtn = document.getElementById("startBtn");
+const logEl = document.getElementById("log");
+
+function log(msg) {
+  logEl.textContent += msg + "\n";
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ---------- WebSocket: auto-connect with indefinite retry ----------
+let ws = null;
+let wsOpen = false;
+
+function connectWs() {
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { wsOpen = true; log("[connected] " + WS_URL); render(); };
+  ws.onclose = () => { wsOpen = false; render(); setTimeout(connectWs, 2000); };
+  ws.onerror = () => { /* onclose follows and triggers the retry */ };
+  ws.onmessage = onWsMessage;
+}
+connectWs();
+
+// ---------- Pipeline state machine ----------
+// disconnected-ui | idle (listening for wake word) | wake | recording | sending | awaiting | speaking
+let pipelineState = "idle";
+let lastWakeAt = 0;
+
+function render() {
+  const label = !wsOpen
+    ? "Reconnecting to gateway..."
+    : {
+        idle: 'Listening for "Hey Jarvis"...',
+        wake: "Wake word detected!",
+        recording: "Listening to you...",
+        sending: "Sending...",
+        awaiting: "Thinking...",
+        speaking: "Speaking...",
+      }[pipelineState] || pipelineState;
+  statusEl.textContent = label;
+  orbEl.className = !wsOpen ? "state-disconnected" : "state-" + pipelineState;
+}
+
+function setState(s) { pipelineState = s; render(); }
+render();
+
+// ---------- Audio pipeline (mic -> wake word -> recording -> send) ----------
+let audioCtx = null;
+let ttsFormat = null;
+let ttsChunks = [];
+let melSession, embeddingSession, wakeSession;
+let melBuffer = [];
+let embeddingBuffer = [];
+let utteranceFrames = [];
+let hasSpoken = false;
+let silenceFrameCount = 0;
+let recordFrameCount = 0;
+
+async function loadModels() {
+  const opts = { executionProviders: ["wasm"] };
+  [melSession, embeddingSession, wakeSession] = await Promise.all([
+    ort.InferenceSession.create("models/melspectrogram.onnx", opts),
+    ort.InferenceSession.create("models/embedding_model.onnx", opts),
+    ort.InferenceSession.create("models/hey_jarvis_v0.1.onnx", opts),
+  ]);
+}
+
+function resetWakeWordBuffers() {
+  melBuffer = [];
+  embeddingBuffer = [];
+  for (let i = 0; i < 16; i++) embeddingBuffer.push(new Float32Array(96));
+}
+
+async function scoreWakeWord(frame) {
+  const melFeeds = {};
+  melFeeds[melSession.inputNames[0]] = new ort.Tensor("float32", frame, [1, FRAME_SIZE]);
+  const melOut = await melSession.run(melFeeds);
+  const rawMel = melOut[melSession.outputNames[0]].data;
+  const mel = new Float32Array(rawMel.length);
+  for (let i = 0; i < rawMel.length; i++) mel[i] = rawMel[i] / 10.0 + 2.0; // openWakeWord's fixed normalization
+  for (let j = 0; j < 5; j++) melBuffer.push(mel.slice(j * 32, (j + 1) * 32));
+
+  let bestScore = 0;
+  while (melBuffer.length >= 76) {
+    const flatMel = new Float32Array(76 * 32);
+    for (let j = 0; j < 76; j++) flatMel.set(melBuffer[j], j * 32);
+    const embFeeds = {};
+    embFeeds[embeddingSession.inputNames[0]] = new ort.Tensor("float32", flatMel, [1, 76, 32, 1]);
+    const embOut = await embeddingSession.run(embFeeds);
+    embeddingBuffer.shift();
+    embeddingBuffer.push(new Float32Array(embOut[embeddingSession.outputNames[0]].data));
+
+    const flatEmb = new Float32Array(16 * 96);
+    for (let j = 0; j < 16; j++) flatEmb.set(embeddingBuffer[j], j * 96);
+    const wakeFeeds = {};
+    wakeFeeds[wakeSession.inputNames[0]] = new ort.Tensor("float32", flatEmb, [1, 16, 96]);
+    const wakeOut = await wakeSession.run(wakeFeeds);
+    bestScore = Math.max(bestScore, wakeOut[wakeSession.outputNames[0]].data[0]);
+    melBuffer.splice(0, 8);
+  }
+  return bestScore;
+}
+
+function rmsOf(frame) {
+  let sum = 0;
+  for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+  return Math.sqrt(sum / frame.length);
+}
+
+function playBeep() {
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.frequency.value = 880;
+  gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.15);
+}
+
+async function onAudioFrame(frame) {
+  const level = rmsOf(frame);
+  levelFillEl.style.width = Math.min(100, level * 400) + "%";
+
+  if (pipelineState === "idle") {
+    const score = await scoreWakeWord(frame);
+    const now = Date.now();
+    if (score > WAKE_THRESHOLD && now - lastWakeAt > WAKE_COOLDOWN_MS) {
+      lastWakeAt = now;
+      log(`[wake word detected: hey_jarvis score=${score.toFixed(2)}]`);
+      playBeep();
+      utteranceFrames = [];
+      hasSpoken = false;
+      silenceFrameCount = 0;
+      recordFrameCount = 0;
+      setState("recording");
+    }
+  } else if (pipelineState === "recording") {
+    utteranceFrames.push(frame.slice());
+    recordFrameCount++;
+    if (level > SPEECH_RMS) {
+      hasSpoken = true;
+      silenceFrameCount = 0;
+    } else if (hasSpoken) {
+      silenceFrameCount++;
+    }
+    if ((hasSpoken && silenceFrameCount >= SILENCE_HANGOVER_FRAMES) || recordFrameCount >= MAX_RECORD_FRAMES) {
+      finalizeUtterance();
+    }
+  }
+}
+
+function finalizeUtterance() {
+  setState("sending");
+  resetWakeWordBuffers();
+
+  const total = utteranceFrames.reduce((n, f) => n + f.length, 0);
+  const merged = new Float32Array(total);
+  let offset = 0;
+  for (const f of utteranceFrames) { merged.set(f, offset); offset += f.length; }
+  utteranceFrames = [];
+
+  const int16 = new Int16Array(merged.length);
+  for (let i = 0; i < merged.length; i++) {
+    const s = Math.max(-1, Math.min(1, merged[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+
+  if (!ws || !wsOpen) {
+    log("[not connected - dropping utterance]");
+    setState("idle");
+    return;
+  }
+
+  log(`[sending utterance: ${int16.byteLength} bytes @16kHz]`);
+  ws.send(JSON.stringify({ type: "utterance_start" }));
+  const CHUNK = 3200;
+  const bytes = new Uint8Array(int16.buffer);
+  for (let i = 0; i < bytes.length; i += CHUNK) ws.send(bytes.slice(i, i + CHUNK).buffer);
+  ws.send(JSON.stringify({ type: "utterance_end" }));
+  setState("awaiting");
+}
+
+function onWsMessage(event) {
+  if (typeof event.data === "string") {
+    const msg = JSON.parse(event.data);
+    log("<- " + JSON.stringify(msg));
+    if (msg.type === "tts_start") {
+      ttsFormat = msg;
+      ttsChunks = [];
+      setState("speaking");
+    } else if (msg.type === "tts_end") {
+      playReply();
+    } else if (msg.type === "error" || msg.type === "cancelled") {
+      setState("idle");
+    }
+  } else {
+    ttsChunks.push(event.data);
+  }
+}
+
+function playReply() {
+  if (!ttsFormat || ttsChunks.length === 0) { setState("idle"); return; }
+  const total = ttsChunks.reduce((n, b) => n + b.byteLength, 0);
+  const pcmBytes = new Uint8Array(total);
+  let offset = 0;
+  for (const b of ttsChunks) { pcmBytes.set(new Uint8Array(b), offset); offset += b.byteLength; }
+
+  const blockAlign = ttsFormat.channels * ttsFormat.sample_width;
+  const header = new ArrayBuffer(44);
+  const view = new DataView(header);
+  const writeStr = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+  writeStr(0, "RIFF"); view.setUint32(4, 36 + pcmBytes.length, true); writeStr(8, "WAVE");
+  writeStr(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+  view.setUint16(22, ttsFormat.channels, true); view.setUint32(24, ttsFormat.sample_rate, true);
+  view.setUint32(28, ttsFormat.sample_rate * blockAlign, true); view.setUint16(32, blockAlign, true);
+  view.setUint16(34, ttsFormat.sample_width * 8, true);
+  writeStr(36, "data"); view.setUint32(40, pcmBytes.length, true);
+
+  const audioEl = new Audio(URL.createObjectURL(new Blob([header, pcmBytes], { type: "audio/wav" })));
+  audioEl.onended = () => setState("idle");
+  audioEl.onerror = () => setState("idle");
+  audioEl.play();
+}
+
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
+  startBtn.textContent = "Loading wake-word models...";
+  try {
+    await loadModels();
+    resetWakeWordBuffers();
+
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+
+    const source = audioCtx.createMediaStreamSource(stream);
+    const processorCode = `
+      class FrameProcessor extends AudioWorkletProcessor {
+        constructor() { super(); this._buf = new Float32Array(${FRAME_SIZE}); this._pos = 0; }
+        process(inputs) {
+          const input = inputs[0][0];
+          if (input) {
+            for (let i = 0; i < input.length; i++) {
+              this._buf[this._pos++] = input[i];
+              if (this._pos === ${FRAME_SIZE}) { this.port.postMessage(this._buf.slice()); this._pos = 0; }
+            }
+          }
+          return true;
+        }
+      }
+      registerProcessor("frame-processor", FrameProcessor);
+    `;
+    const workletUrl = URL.createObjectURL(new Blob([processorCode], { type: "application/javascript" }));
+    await audioCtx.audioWorklet.addModule(workletUrl);
+    const workletNode = new AudioWorkletNode(audioCtx, "frame-processor");
+    workletNode.port.onmessage = (e) => onAudioFrame(e.data);
+    source.connect(workletNode);
+
+    startBtn.style.display = "none";
+    setState("idle");
+    log("[listening for wake word 'hey jarvis']");
+  } catch (err) {
+    log("[error] " + err.message);
+    startBtn.disabled = false;
+    startBtn.textContent = "Enable Microphone & Start";
+  }
+};
+</script>
+</body>
+</html>
